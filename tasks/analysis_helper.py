@@ -176,49 +176,40 @@ def load_musicnn_sessions(model_paths):
 _migraphx_warmed_up = False  # per-process flag
 
 
-def migraphx_warmup(embedding_session, model_path, buckets, tensor_input_name, tensor_output_name):
-    """Pre-compile all MIGraphX bucket sizes on first call in this worker process.
+def migraphx_warmup(embedding_session, buckets, tensor_input_name, tensor_output_name):
+    """Pre-compile all MIGraphX bucket sizes into the existing session.
 
-    MIGraphX JIT-compiles the ONNX graph once per unique input batch size.
-    Running a tiny dummy inference for each bucket upfront — while holding
+    MIGraphX JIT-compiles the ONNX graph once per unique input shape per session.
+    Running dummy inference for each bucket through the SAME session — while holding
     the cross-process compile lock — means:
       1. All compilations happen sequentially (no concurrent GPU hang risk).
-      2. Subsequent real-track inferences are already warm and complete in ms.
+      2. The existing session has all bucket shapes pre-compiled.
+      3. Every subsequent real-track inference hits the warm compiled path.
     Called at most once per worker process lifetime (guarded by _migraphx_warmed_up).
     """
     global _migraphx_warmed_up
     if _migraphx_warmed_up:
-        return embedding_session
+        return
     _migraphx_warmed_up = True
 
     if 'MIGraphXExecutionProvider' not in embedding_session.get_providers():
-        return embedding_session
+        return
 
-    logger.info(f"MIGraphX warmup: pre-compiling {len(buckets)} bucket sizes {buckets} ...")
-    opts = get_provider_options()
-    sess_opts = _default_sess_options()
-
-    # Get input shape (excluding batch dim) from the current session
     inp = embedding_session.get_inputs()[0]
     patch_shape = inp.shape[1:]  # e.g. (187, 96)
 
-    warmed_sessions = {}
+    logger.info(f"MIGraphX warmup: pre-compiling {len(buckets)} bucket sizes {buckets} "
+                f"into existing session (serialised via compile lock) ...")
     for bucket in buckets:
         dummy = np.zeros((bucket, *patch_shape), dtype=np.float32)
         feed = {tensor_input_name: dummy}
         try:
-            # create_onnx_session holds the compile lock — serialises across workers
-            sess = create_onnx_session(model_path, opts, label=f'warmup_b{bucket}',
-                                       sess_options=sess_opts)
-            sess.run([tensor_output_name], feed)
-            logger.info(f"  bucket {bucket}: compiled ✓")
-            warmed_sessions[bucket] = sess
+            with _migraphx_compile_lock():
+                embedding_session.run([tensor_output_name], feed)
+            logger.info(f"  bucket {bucket}: ✓")
         except Exception as exc:
             logger.warning(f"  bucket {bucket}: warmup failed ({exc}), continuing")
-
-    # Return the session for the smallest bucket as the base session
-    first_bucket = buckets[0]
-    return warmed_sessions.get(first_bucket, embedding_session), warmed_sessions
+    logger.info("MIGraphX warmup complete — all bucket sizes pre-compiled")
 
 
 def cleanup_musicnn_sessions(onnx_sessions, context=""):

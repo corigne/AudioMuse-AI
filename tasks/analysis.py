@@ -280,21 +280,16 @@ def analyze_track(file_path, mood_labels_list, model_paths, onnx_sessions=None, 
         original_prediction_sess = prediction_sess
 
         # On first invocation in this worker process, pre-compile all MIGraphX
-        # bucket sizes sequentially (holding the cross-process compile lock).
-        # This eliminates mid-library cold-start stalls and prevents concurrent
-        # GPU compilation hangs across multiple worker processes.
+        # bucket sizes into the existing session (serialised via cross-process
+        # file lock).  This eliminates mid-library cold-start stalls and prevents
+        # concurrent GPU compilation hangs across worker processes.
         if 'MIGraphXExecutionProvider' in embedding_sess.get_providers():
-            result = migraphx_warmup(
-                embedding_sess, model_paths['embedding'],
+            migraphx_warmup(
+                embedding_sess,
                 _MIGRAPHX_PATCH_BUCKETS,
                 DEFINED_TENSOR_NAMES['embedding']['input'],
                 DEFINED_TENSOR_NAMES['embedding']['output'],
             )
-            if isinstance(result, tuple):
-                embedding_sess, _warmed = result
-                original_embedding_sess = embedding_sess
-                if onnx_sessions is not None:
-                    onnx_sessions['embedding'] = embedding_sess
 
         # Pad spectrogram patches to the next fixed bucket size when running
         # under MIGraphX.  MIGraphX JIT-compiles per unique input shape; without
