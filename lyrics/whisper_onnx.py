@@ -214,18 +214,13 @@ class _OnnxWhisperPipeline:
             path, intra_op_label,
         )
 
-        try:
-            from tasks.analysis_helper import create_onnx_session
-            self.encoder_session = create_onnx_session(
-                str(encoder_path), sess_options=sess_opts, label='whisper_encoder')
-            self.decoder_session = create_onnx_session(
-                str(decoder_path), sess_options=sess_opts, label='whisper_decoder')
-        except Exception as exc:
-            logger.warning('Whisper: provider helper unavailable (%s) — CPU only', exc)
-            self.encoder_session = ort.InferenceSession(
-                str(encoder_path), sess_opts, providers=['CPUExecutionProvider'])
-            self.decoder_session = ort.InferenceSession(
-                str(decoder_path), sess_opts, providers=['CPUExecutionProvider'])
+        # Force CPU for Whisper transcription: GPU (MIGraphX) causes multi-minute
+        # JIT compilation per worker session, and concurrent workers compiling
+        # simultaneously hang the GPU. Lyrics ASR is not on the hot path.
+        self.encoder_session = ort.InferenceSession(
+            str(encoder_path), sess_opts, providers=['CPUExecutionProvider'])
+        self.decoder_session = ort.InferenceSession(
+            str(decoder_path), sess_opts, providers=['CPUExecutionProvider'])
         logger.info('Whisper-small active providers: encoder=%s decoder=%s',
                     self.encoder_session.get_providers()[0],
                     self.decoder_session.get_providers()[0])
