@@ -126,23 +126,16 @@ def _load_translator(model_dir: Optional[str] = None):
             if not os.path.isfile(p):
                 raise RuntimeError(f'Translator ONNX file missing: {p}')
 
+        # Force CPU for Marian translation: same GPU contention / JIT hang risk
+        # as Whisper on MIGraphX workers. Translation is not on the hot path.
         logger.info('Loading translator encoder: %s', encoder_path)
-        try:
-            from tasks.analysis_helper import create_onnx_session
-            encoder_session = create_onnx_session(
-                encoder_path, sess_options=sess_opts, label='marian_encoder')
-            logger.info('Loading translator merged decoder: %s', decoder_path)
-            decoder_session = create_onnx_session(
-                decoder_path, sess_options=sess_opts, label='marian_decoder')
-        except Exception as exc:
-            logger.warning('Marian: provider helper unavailable (%s) — CPU only', exc)
-            encoder_session = ort.InferenceSession(
-                encoder_path, sess_options=sess_opts,
-                providers=['CPUExecutionProvider'])
-            logger.info('Loading translator merged decoder: %s', decoder_path)
-            decoder_session = ort.InferenceSession(
-                decoder_path, sess_options=sess_opts,
-                providers=['CPUExecutionProvider'])
+        encoder_session = ort.InferenceSession(
+            encoder_path, sess_options=sess_opts,
+            providers=['CPUExecutionProvider'])
+        logger.info('Loading translator merged decoder: %s', decoder_path)
+        decoder_session = ort.InferenceSession(
+            decoder_path, sess_options=sess_opts,
+            providers=['CPUExecutionProvider'])
         logger.info('Marian active providers: encoder=%s decoder=%s',
                     encoder_session.get_providers()[0],
                     decoder_session.get_providers()[0])
