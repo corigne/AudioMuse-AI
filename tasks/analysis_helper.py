@@ -1,11 +1,11 @@
 # tasks/analysis_helper.py
 """Reusable building blocks extracted from tasks.analysis."""
 
-import fcntl
 import gc
 import importlib
 import logging
 import os
+import time
 from contextlib import contextmanager
 
 import numpy as np
@@ -31,23 +31,43 @@ from psycopg2 import sql as pgsql
 
 logger = logging.getLogger(__name__)
 
-# Cross-process file lock to serialize MIGraphX JIT compilation.
-# MIGraphX compiles the ONNX graph once per unique input shape per ORT session.
-# When multiple worker processes compile simultaneously, they can trigger a GPU
-# hardware exception (HW Exception by GPU, exit 134). Serializing ensures only
-# one worker compiles at a time; all others wait and then load the warm GPU.
-_MIGRAPHX_COMPILE_LOCK_PATH = '/tmp/.audiomuse_migraphx_compile.lock'
+# Redis-based distributed lock to serialize MIGraphX JIT compilation across
+# ALL worker containers.  Each Docker container has its own /tmp, so a file
+# lock only protects within a single container.  Concurrent GPU compilation
+# across containers causes HW Exception (exit 134).  Using Redis (which every
+# worker already connects to) provides global serialisation.
+_MIGRAPHX_LOCK_KEY = 'migraphx:compile:lock'
+_MIGRAPHX_LOCK_TTL = 900   # max seconds to hold the lock (safety valve)
+_MIGRAPHX_LOCK_POLL = 5    # seconds between poll attempts while waiting
 
 
 @contextmanager
 def _migraphx_compile_lock():
-    """Exclusive cross-process file lock around MIGraphX session creation."""
-    with open(_MIGRAPHX_COMPILE_LOCK_PATH, 'w') as _f:
-        fcntl.flock(_f, fcntl.LOCK_EX)
+    """Distributed Redis lock around MIGraphX compilation.
+
+    Serialises GPU compilation across all worker containers so only one
+    process compiles at a time.  Falls back to a no-op context if Redis is
+    unreachable so a single-container setup still works.
+    """
+    import redis as _redis_mod
+    redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+    try:
+        r = _redis_mod.from_url(redis_url, socket_connect_timeout=5)
+        acquired = False
+        while not acquired:
+            acquired = r.set(_MIGRAPHX_LOCK_KEY, str(os.getpid()),
+                             ex=_MIGRAPHX_LOCK_TTL, nx=True)
+            if not acquired:
+                logger.debug("MIGraphX compile lock held by another worker — waiting %ds ...",
+                             _MIGRAPHX_LOCK_POLL)
+                time.sleep(_MIGRAPHX_LOCK_POLL)
         try:
             yield
         finally:
-            fcntl.flock(_f, fcntl.LOCK_UN)
+            r.delete(_MIGRAPHX_LOCK_KEY)
+    except Exception as exc:
+        logger.warning("MIGraphX Redis lock unavailable (%s) — proceeding without lock", exc)
+        yield
 
 
 # --- ONNX -------------------------------------------------------------------
