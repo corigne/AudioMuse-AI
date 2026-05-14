@@ -20,6 +20,13 @@ from tempfile import NamedTemporaryFile
 import librosa
 import onnxruntime as ort  # re-exported: tests patch `tasks.analysis.ort.InferenceSession`
 
+# MIGraphX (AMD) JIT-compiles the ONNX graph once per unique input batch size.
+# By rounding up to these fixed buckets we limit recompilation to at most
+# len(_MIGRAPHX_PATCH_BUCKETS) events per worker session rather than once per
+# track.  256 comfortably covers AUDIO_LOAD_TIMEOUT=600 s (≈200 patches max).
+# Only applied when MIGraphXExecutionProvider is active; CPU/CUDA are unaffected.
+_MIGRAPHX_PATCH_BUCKETS = (64, 128, 256)
+
 # RQ import
 from rq import get_current_job, Retry
 from rq.job import Job
@@ -242,6 +249,8 @@ def analyze_track(file_path, mood_labels_list, model_paths, onnx_sessions=None, 
         logger.error(f"Spectrogram creation failed for {os.path.basename(file_path)}: {e}", exc_info=True)
         return (None, None, None, None) if return_audio else (None, None)
 
+    n_real_patches = len(final_patches)
+
     # --- 3. Run Main Models (Embedding and Prediction) ---
     embedding_sess = None
     prediction_sess = None
@@ -268,6 +277,26 @@ def analyze_track(file_path, mood_labels_list, model_paths, onnx_sessions=None, 
         # Capture originals so we can detect OOM-fallback replacements below.
         original_embedding_sess = embedding_sess
         original_prediction_sess = prediction_sess
+
+        # Pad spectrogram patches to the next fixed bucket size when running
+        # under MIGraphX.  MIGraphX JIT-compiles per unique input shape; without
+        # this a 5 000-track library triggers hundreds of ~7-minute compilations.
+        # Padding with zeros doesn't affect the real-patch embeddings because
+        # the embedding model treats the batch dimension independently.
+        # The padded tail is trimmed from embeddings before the prediction step.
+        if 'MIGraphXExecutionProvider' in embedding_sess.get_providers():
+            bucket = next((b for b in _MIGRAPHX_PATCH_BUCKETS if b >= n_real_patches), None)
+            if bucket is not None and bucket > n_real_patches:
+                pad = np.zeros(
+                    (bucket - n_real_patches, final_patches.shape[1], final_patches.shape[2]),
+                    dtype=np.float32,
+                )
+                final_patches = np.concatenate([final_patches, pad], axis=0)
+                logger.debug(
+                    f"MIGraphX: padded {n_real_patches} → {bucket} patches "
+                    f"for {os.path.basename(file_path)}"
+                )
+
         embedding_feed_dict = {DEFINED_TENSOR_NAMES['embedding']['input']: final_patches}
         embeddings_per_patch, embedding_sess = run_inference_with_oom_fallback(
             embedding_sess, embedding_feed_dict,
@@ -287,6 +316,9 @@ def analyze_track(file_path, mood_labels_list, model_paths, onnx_sessions=None, 
             if onnx_sessions is not None:
                 onnx_sessions['embedding'] = embedding_sess
             original_embedding_sess = None
+
+        # Remove any zero-padded tail so prediction only sees real-patch embeddings.
+        embeddings_per_patch = embeddings_per_patch[:n_real_patches]
 
         prediction_feed_dict = {DEFINED_TENSOR_NAMES['prediction']['input']: embeddings_per_patch}
         mood_logits, prediction_sess = run_inference_with_oom_fallback(
