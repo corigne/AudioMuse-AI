@@ -1,9 +1,12 @@
 # tasks/analysis_helper.py
 """Reusable building blocks extracted from tasks.analysis."""
 
+import fcntl
 import gc
 import importlib
 import logging
+import os
+from contextlib import contextmanager
 
 import numpy as np
 import librosa
@@ -27,6 +30,24 @@ from app_helper_artist import upsert_artist_mapping
 from psycopg2 import sql as pgsql
 
 logger = logging.getLogger(__name__)
+
+# Cross-process file lock to serialize MIGraphX JIT compilation.
+# MIGraphX compiles the ONNX graph once per unique input shape per ORT session.
+# When multiple worker processes compile simultaneously, they can trigger a GPU
+# hardware exception (HW Exception by GPU, exit 134). Serializing ensures only
+# one worker compiles at a time; all others wait and then load the warm GPU.
+_MIGRAPHX_COMPILE_LOCK_PATH = '/tmp/.audiomuse_migraphx_compile.lock'
+
+
+@contextmanager
+def _migraphx_compile_lock():
+    """Exclusive cross-process file lock around MIGraphX session creation."""
+    with open(_MIGRAPHX_COMPILE_LOCK_PATH, 'w') as _f:
+        fcntl.flock(_f, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(_f, fcntl.LOCK_UN)
 
 
 # --- ONNX -------------------------------------------------------------------
@@ -115,7 +136,16 @@ def create_onnx_session(model_path, provider_options=None, label="", sess_option
     if sess_options is None:
         sess_options = _default_sess_options()
     extra = {'sess_options': sess_options}
+    uses_migraphx = any(p[0] == 'MIGraphXExecutionProvider' for p in opts)
     try:
+        if uses_migraphx:
+            with _migraphx_compile_lock():
+                return ort.InferenceSession(
+                    model_path,
+                    providers=[p[0] for p in opts],
+                    provider_options=[p[1] for p in opts],
+                    **extra,
+                )
         return ort.InferenceSession(
             model_path,
             providers=[p[0] for p in opts],
@@ -141,6 +171,54 @@ def load_musicnn_sessions(model_paths):
     except Exception as e:
         logger.error(f"Failed to load MusiCNN models: {e}")
         return None
+
+
+_migraphx_warmed_up = False  # per-process flag
+
+
+def migraphx_warmup(embedding_session, model_path, buckets, tensor_input_name, tensor_output_name):
+    """Pre-compile all MIGraphX bucket sizes on first call in this worker process.
+
+    MIGraphX JIT-compiles the ONNX graph once per unique input batch size.
+    Running a tiny dummy inference for each bucket upfront — while holding
+    the cross-process compile lock — means:
+      1. All compilations happen sequentially (no concurrent GPU hang risk).
+      2. Subsequent real-track inferences are already warm and complete in ms.
+    Called at most once per worker process lifetime (guarded by _migraphx_warmed_up).
+    """
+    global _migraphx_warmed_up
+    if _migraphx_warmed_up:
+        return embedding_session
+    _migraphx_warmed_up = True
+
+    if 'MIGraphXExecutionProvider' not in embedding_session.get_providers():
+        return embedding_session
+
+    logger.info(f"MIGraphX warmup: pre-compiling {len(buckets)} bucket sizes {buckets} ...")
+    opts = get_provider_options()
+    sess_opts = _default_sess_options()
+
+    # Get input shape (excluding batch dim) from the current session
+    inp = embedding_session.get_inputs()[0]
+    patch_shape = inp.shape[1:]  # e.g. (187, 96)
+
+    warmed_sessions = {}
+    for bucket in buckets:
+        dummy = np.zeros((bucket, *patch_shape), dtype=np.float32)
+        feed = {tensor_input_name: dummy}
+        try:
+            # create_onnx_session holds the compile lock — serialises across workers
+            sess = create_onnx_session(model_path, opts, label=f'warmup_b{bucket}',
+                                       sess_options=sess_opts)
+            sess.run([tensor_output_name], feed)
+            logger.info(f"  bucket {bucket}: compiled ✓")
+            warmed_sessions[bucket] = sess
+        except Exception as exc:
+            logger.warning(f"  bucket {bucket}: warmup failed ({exc}), continuing")
+
+    # Return the session for the smallest bucket as the base session
+    first_bucket = buckets[0]
+    return warmed_sessions.get(first_bucket, embedding_session), warmed_sessions
 
 
 def cleanup_musicnn_sessions(onnx_sessions, context=""):
