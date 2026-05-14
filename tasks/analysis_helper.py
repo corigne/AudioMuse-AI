@@ -37,8 +37,13 @@ logger = logging.getLogger(__name__)
 # across containers causes HW Exception (exit 134).  Using Redis (which every
 # worker already connects to) provides global serialisation.
 _MIGRAPHX_LOCK_KEY = 'migraphx:compile:lock'
-_MIGRAPHX_LOCK_TTL = 900   # max seconds to hold the lock (safety valve)
+# Initial TTL for the lock.  Cold MIGraphX compilation can take up to 10+ min
+# per bucket size (64/128/256).  Warmup runs 3 buckets sequentially, so we
+# need at least 30+ min headroom.  A background thread renews the TTL every
+# 60 s while the lock is held, so this is only a safety valve.
+_MIGRAPHX_LOCK_TTL = 3600  # 1 hour safety valve; heartbeat keeps it alive
 _MIGRAPHX_LOCK_POLL = 5    # seconds between poll attempts while waiting
+_MIGRAPHX_LOCK_HEARTBEAT = 60  # seconds between TTL renewals
 
 
 @contextmanager
@@ -48,22 +53,43 @@ def _migraphx_compile_lock():
     Serialises GPU compilation across all worker containers so only one
     process compiles at a time.  Falls back to a no-op context if Redis is
     unreachable so a single-container setup still works.
+
+    A background heartbeat thread renews the TTL every 60 s while the lock
+    is held, preventing expiry during the slow cold-compile path.
     """
+    import threading
     import redis as _redis_mod
     redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
     try:
         r = _redis_mod.from_url(redis_url, socket_connect_timeout=5)
+        lock_id = str(os.getpid())
         acquired = False
         while not acquired:
-            acquired = r.set(_MIGRAPHX_LOCK_KEY, str(os.getpid()),
+            acquired = r.set(_MIGRAPHX_LOCK_KEY, lock_id,
                              ex=_MIGRAPHX_LOCK_TTL, nx=True)
             if not acquired:
-                logger.debug("MIGraphX compile lock held by another worker — waiting %ds ...",
+                logger.debug("MIGraphX compile lock held — waiting %ds ...",
                              _MIGRAPHX_LOCK_POLL)
                 time.sleep(_MIGRAPHX_LOCK_POLL)
+
+        # Background thread renews TTL while we hold the lock.
+        _stop_heartbeat = threading.Event()
+
+        def _heartbeat():
+            while not _stop_heartbeat.wait(timeout=_MIGRAPHX_LOCK_HEARTBEAT):
+                try:
+                    # Only renew if we still own the lock.
+                    if r.get(_MIGRAPHX_LOCK_KEY) == lock_id.encode():
+                        r.expire(_MIGRAPHX_LOCK_KEY, _MIGRAPHX_LOCK_TTL)
+                except Exception:
+                    pass
+
+        _hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+        _hb_thread.start()
         try:
             yield
         finally:
+            _stop_heartbeat.set()
             r.delete(_MIGRAPHX_LOCK_KEY)
     except Exception as exc:
         logger.warning("MIGraphX Redis lock unavailable (%s) — proceeding without lock", exc)
