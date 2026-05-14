@@ -37,3 +37,11 @@ services:
       - video
       - render
     shm_size: "2gb"
+
+    # If your AudioMuse server and workers are on different hosts, the media
+    # server hostname (e.g. "navidrome", "jellyfin") won't resolve from the
+    # worker container. Add an extra_hosts entry pointing it at the server's
+    # LAN IP so the workers can reach it for track metadata lookups.
+    # extra_hosts:
+    #   - "navidrome:192.168.2.x"
+    #   - "jellyfin:192.168.2.x"
