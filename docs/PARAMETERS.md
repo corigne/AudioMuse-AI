@@ -189,7 +189,9 @@ These are the default parameters used when launching analysis or clustering task
 | `LYRICS_ASR_BEAM_SIZE`                      | Beam search width for the Whisper-small ASR decoder. 1 = pure greedy (fastest, most error-prone), 2 = sweet spot (catches stuck-loop attractors at ~2× greedy cost), 5 = Whisper-upstream default (max quality, ~5× cost). Each extra beam adds one extra decoder.run per generated token plus its own KV cache (~30-80 MB at a full 30 s chunk). | `5` |
 | `LYRICS_ASR_MIN_AVG_LOGPROB`                | General avg_logprob floor for ASR output. Whisper-small's per-chunk avg_logprob is averaged over the track; if the result is below this threshold the transcript is dropped as likely hallucination and the track is treated as instrumental. Values are negative — closer to `0` is stricter (rejects more), more negative is looser (accepts more). `-1.0` is a permissive global floor that catches only truly degenerate transcriptions. | `-1.0` |
 | `LYRICS_ASR_NON_ENGLISH_MIN_LOGPROB`        | Additional avg_logprob floor applied only when Whisper reports a non-English language. Whisper-small is English-biased, so legitimate non-English transcriptions (CJK, Cyrillic, Arabic, etc.) naturally score lower in the `-0.5` to `-0.8` range; set this looser than the English floor (more negative) to avoid dropping valid foreign-language lyrics. Raise toward `-0.5` if you see garbage non-English transcriptions slipping through. | `-0.85` |
-| `LYRICS_WHISPER_MODEL_DIR`                  | Path to the Whisper-small ONNX bundle directory. Must contain `encoder_model.onnx`, `decoder_model_merged.onnx`, `tokenizer.json` and the rest of the HuggingFace optimum export. Pre-bundled in the official Docker image from `lyrics_model_whisper.tar.gz`. | `/app/model/whisper-small-onnx` |
+| `LYRICS_WHISPER_MODEL_DIR`                  | Path to the Whisper model directory. Accepts either an ONNX export (default, must contain `encoder_model.onnx` and `decoder_model_merged.onnx`) or a faster-whisper CTranslate2 export (must contain `model.bin` and `config.json`). The backend is selected automatically based on which files are present. When built with `WITH_FASTER_WHISPER=1`, the image pre-populates `/app/model/faster-whisper-small` with the CTranslate2 export of Whisper-small. | `/app/model/whisper-small-onnx` |
+| `WHISPER_DEVICE`                            | Device for faster-whisper inference. `cpu` runs on CPU; `cuda` targets NVIDIA GPUs; `hip` targets AMD ROCm. Only relevant when `LYRICS_WHISPER_MODEL_DIR` points to a faster-whisper CTranslate2 export. | `cpu` |
+| `WHISPER_COMPUTE_TYPE`                      | CTranslate2 quantisation mode for faster-whisper. `int8` (default) uses 8-bit integer weights -- minimal RAM, best CPU throughput. `float16` uses half-precision -- recommended for GPU inference. `float32` disables quantisation. | `int8` |
 | `LYRICS_WHISPER_LANG_CONFIDENCE`            | Confidence floor for Whisper's built-in language detection (softmax over the 99 language tokens at the first decoder step). Chunks whose top-language probability falls below this are dropped and the track is treated as instrumental — no external langdetect involved. Lower to 0.5 if you find legit songs being dropped. | `0.7` |
 | `LYRICS_WHISPER_MIN_FREE_RAM_GB`            | Minimum free RAM (GB) before Whisper loads. Whisper-small peaks ~1.5 GB, so 2.5 GB leaves headroom. | `2.5` |
 | `SEM_GROVE_WEIGHT_LYRICS`                   | Contribution of the lyrics embedding to the merged SemGrove cosine similarity (squared scale factor, [0.0-1.0]). Requires index rebuild after change. | `0.75` |
@@ -199,6 +201,21 @@ These are the default parameters used when launching analysis or clustering task
 | `ESSENTIA_MOOD_MODEL_DIR`                   | Directory containing the Essentia ONNX models: `msd-musicnn-1.onnx` (backbone) and one `mood_<label>-msd-musicnn-1.onnx` file per label. Pre-populated in the Docker image when built with `WITH_ESSENTIA_MOOD_MODELS=1`. | `/app/model/essentia-mood` |
 | `ESSENTIA_MOOD_LABELS`                      | Comma-separated list of mood axes to score. Must have a corresponding `mood_<label>-msd-musicnn-1.onnx` in `ESSENTIA_MOOD_MODEL_DIR`. Changing this list changes which fields appear in `other_features` and the CLAP prompt cache; wipe analysis data after changing. | `aggressive,happy,party,relaxed,sad,danceable` |
 
+### CLAP mood prompt customization
+
+When `USE_ESSENTIA_MOOD_MODELS=0` (default), mood scores are derived from CLAP cosine similarity between the track's audio embedding and a text prompt for each label. The prompts are defined in `OTHER_FEATURE_PROMPTS` in `config.py`. Single-word labels produce compressed cosine scores with poor inter-track discrimination; descriptive sentence prompts yield wider spread and better genre differentiation.
+
+The defaults ship as full sentences. To override, edit `OTHER_FEATURE_PROMPTS` in `config.py`:
+
+```python
+OTHER_FEATURE_PROMPTS = {
+    'danceable': 'a rhythmic, danceable song with a strong steady beat that makes you want to move',
+    'aggressive': 'an aggressive, intense, hard-hitting track with raw energy and power',
+    # ...
+}
+```
+
+After changing any prompt, the Redis CLAP text embedding cache is invalidated automatically (the cache key includes a short hash of the prompt texts). No manual Redis flush is needed.
 
 The **AI model** tested for Clustering naming and for the instant playlist functionality are:
 
