@@ -56,6 +56,32 @@ MIGraphX JIT-compiles ONNX graphs on first use and caches the result to disk. Wi
 
 ---
 
+## Known accuracy characteristics and limitations
+
+These apply regardless of GPU backend (AMD or NVIDIA) and reflect model-level behaviour rather than infrastructure issues.
+
+**BPM (tempo detection)**
+
+`librosa.beat.beat_track` can return half-tempo for high-energy tracks with a strong sub-beat structure. A 157 BPM track may be reported as 78 BPM. This is an upstream librosa limitation. Displayed tempo values should be treated as approximate.
+
+**Key detection**
+
+The chromagram template-matching approach has a bias toward relative-minor interpretations and can confuse a major key with its relative minor (e.g., A major vs. F# minor). Key detection accuracy is directionally useful but not suitable for strict harmonic matching.
+
+**Mood scores (CLAP path)**
+
+When `USE_ESSENTIA_MOOD_MODELS=0`, mood scores are CLAP cosine similarities against text prompts. These values are on a relative scale: a score of 0.7 does not mean 70% "happy" in absolute terms. Use them for ranking and filtering within a library, not as absolute measurements. Full-sentence prompts (the default in `OTHER_FEATURE_PROMPTS`) produce wider spread than single-word labels.
+
+**Mood scores (Essentia path)**
+
+When `USE_ESSENTIA_MOOD_MODELS=1`, mood scores come from MTG-Jamendo classifiers trained on genre-annotated data. The `party`, `relaxed`, and `sad` classifier ONNX exports have reversed class ordering compared to `aggressive`, `happy`, and `danceable`; AudioMuse-AI handles this internally via per-label index mapping. Scores across the six axes are independent -- a track can score high on both `party` and `danceable` simultaneously.
+
+**Lyrics transcription accuracy**
+
+Whisper-small has a word error rate of approximately 15-25% on English pop/rock. Accuracy degrades on: rap and hip-hop (dense syllable timing), non-English lyrics, proper nouns, and genre-specific slang. The lyrics embedding is used for similarity search, not display; moderate transcription errors have limited impact on retrieval quality.
+
+---
+
 We suggest **8GB VRAM** on GPU, with less you can experience the NON BLOCKING OutOFMemory error (that are handled by switching to CPU). The `PER_SONG_MODEL_RELOAD` env variable, that by default is TRUE, help cleaning the memory by entirely reloading the model each time, on the other side it slow the analysis process.
 
 
