@@ -29,7 +29,7 @@ from rq.exceptions import NoSuchJobError
 from config import (
     TEMP_DIR, MOOD_LABELS, EMBEDDING_MODEL_PATH, PREDICTION_MODEL_PATH,
     OTHER_FEATURE_LABELS,
-    REBUILD_INDEX_BATCH_SIZE, MAX_QUEUED_ANALYSIS_JOBS, PER_SONG_MODEL_RELOAD,
+    REBUILD_INDEX_BATCH_SIZE, MAX_QUEUED_ANALYSIS_JOBS, PER_SONG_MODEL_RELOAD, SESSION_RECYCLE_INTERVAL,
     AUDIO_LOAD_TIMEOUT, LYRICS_ENABLED,
     USE_ESSENTIA_MOOD_MODELS, ESSENTIA_MOOD_LABELS,
 )
@@ -399,10 +399,16 @@ def analyze_album_task(album_id, album_name, top_n_moods, parent_task_id):
         clap_label_embeddings = None
 
         onnx_sessions = None  # Lazy-loaded on first song that needs MusiCNN.
-        # Recycle interval: 1 song if PER_SONG_MODEL_RELOAD else 20.
-        recycle_interval = 1 if PER_SONG_MODEL_RELOAD else 20
+        # Recycle interval: 1 song if PER_SONG_MODEL_RELOAD, else SESSION_RECYCLE_INTERVAL (default 20).
+        # SESSION_RECYCLE_INTERVAL=0 disables mid-album recycling (fastest; recycles only at album end).
+        if PER_SONG_MODEL_RELOAD:
+            recycle_interval = 1
+        elif SESSION_RECYCLE_INTERVAL == 0:
+            recycle_interval = max(1, len(tracks) + 1)  # effectively never during this album
+        else:
+            recycle_interval = SESSION_RECYCLE_INTERVAL
         session_recycler = SessionRecycler(recycle_interval=recycle_interval)
-        logger.info(f"MusiCNN session recycling: every {recycle_interval} song(s) (PER_SONG_MODEL_RELOAD={PER_SONG_MODEL_RELOAD})")
+        logger.info(f"MusiCNN session recycling: every {recycle_interval} song(s) (PER_SONG_MODEL_RELOAD={PER_SONG_MODEL_RELOAD}, SESSION_RECYCLE_INTERVAL={SESSION_RECYCLE_INTERVAL})")
 
         def log_and_update_album_task(message, progress, **kwargs):
             nonlocal current_progress_val, current_task_logs

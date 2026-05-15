@@ -463,10 +463,18 @@ CLAP_PYTHON_MULTITHREADS = os.environ.get("CLAP_PYTHON_MULTITHREADS", "False").l
 # - true (default): Unload both MusiCNN and CLAP models after each song
 #   Pros: Stable memory usage, prevents VRAM leaks
 #   Cons: Slower (~2-3 seconds overhead per song for model loading)
-# - false: MusiCNN reloads every 20 songs, CLAP at album end (faster but may accumulate memory)
+# - false: MusiCNN reloads every SESSION_RECYCLE_INTERVAL songs (default 20), CLAP at album end
 #   Pros: Faster processing (no per-song reload overhead)
 #   Cons: May see gradual VRAM growth on some systems
 PER_SONG_MODEL_RELOAD = os.environ.get("PER_SONG_MODEL_RELOAD", "true").lower() == "true"
+
+# Override MusiCNN session recycle interval (number of tracks between session rebuilds).
+# Only used when PER_SONG_MODEL_RELOAD=false.
+# 0 = recycle only at album end (fastest, highest peak VRAM).
+# >0 = recycle every N tracks (balances speed vs memory).
+# Default: 20 (upstream default when PER_SONG_MODEL_RELOAD=false).
+_recycle_env = os.environ.get("SESSION_RECYCLE_INTERVAL", "")
+SESSION_RECYCLE_INTERVAL: int = int(_recycle_env) if _recycle_env.isdigit() else 20
 
 # Category weights for CLAP query generation (affects random query sampling probabilities)
 # Higher weights favor categories where CLAP excels (Genre, Instrumentation)

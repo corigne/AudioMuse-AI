@@ -31,6 +31,14 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-audiomuse}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       USE_GPU_CLUSTERING: "false"   # cuML GPU clustering is NVIDIA-only
+      #
+      # Performance: disable per-song model reload (2-3s overhead per track).
+      # The upstream default (true) is conservative for low-RAM/VRAM homelab hardware.
+      # With a GPU that has adequate VRAM, album-end recycling is faster with no stability
+      # penalty. Increase SESSION_RECYCLE_INTERVAL (e.g. 50) if you see VRAM growth.
+      PER_SONG_MODEL_RELOAD: "false"
+      SESSION_RECYCLE_INTERVAL: "0"   # 0 = recycle at album end only
+      #
       # Override gfx version if your card is not auto-detected.
       # RDNA 3 (RX 7000 series):  HSA_OVERRIDE_GFX_VERSION=11.0.0
       # RDNA 2 (RX 6000 series):  HSA_OVERRIDE_GFX_VERSION=10.3.0
@@ -41,6 +49,9 @@ services:
       # LYRICS_WHISPER_MODEL_DIR: "/app/model/faster-whisper-small"
       #
       # --- Optional: Essentia MTG-Jamendo mood classifiers ---
+      # WARNING: Essentia models are licensed for non-commercial use only (CC BY-NC 4.0).
+      # Using them in a commercial deployment may conflict with AGPLv3.
+      # Personal/homelab use only.
       # Requires: image built with --build-arg WITH_ESSENTIA_MOOD_MODELS=1
       # USE_ESSENTIA_MOOD_MODELS: "1"
       # ESSENTIA_MOOD_MODEL_DIR: "/app/model/essentia-mood"
