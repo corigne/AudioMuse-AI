@@ -50,6 +50,7 @@ We are **not affiliated with, endorsed by, or sponsored by** the owners of `audi
 ## **Table of Contents**
 
 - [Quick Start Deployment](#quick-start-deployment)
+- [AMD ROCm GPU Worker](#amd-rocm-gpu-worker)
 - [Hardware Requirements](#hardware-requirements)
 - [Docker Image Tagging Strategy](#docker-image-tagging-strategy)
 - [How To Contribute](#how-to-contribute)
@@ -105,6 +106,53 @@ From `v1.0.0`, only PostgreSQL, Redis, and `TZ` configuration must still be conf
 ```bash
 docker compose -f deployment/docker-compose.yaml down
 ```
+
+## AMD ROCm GPU Worker
+
+This fork adds a dedicated AMD GPU worker built on ROCm + MIGraphX-accelerated ONNX Runtime. On an RX 7900 XTX the full analysis pipeline (CLAP + MusiCNN + Essentia mood + faster-whisper lyrics) runs at approximately 7 seconds per track -- roughly 25x faster than a CPU worker.
+
+For full details see [docs/GPU.md](docs/GPU.md) and [docs/PARAMETERS.md](docs/PARAMETERS.md).
+
+**Requirements:**
+- ROCm 6.x or 7.x host driver (`amdgpu-install`)
+- `amdgpu` group membership: `sudo usermod -aG video,render $USER`
+- `/dev/kfd` and `/dev/dri` available
+
+**Build and start workers:**
+
+```bash
+# Minimal build
+docker build -f Dockerfile.rocm -t audiomuse-ai:rocm .
+
+# With faster-whisper lyrics backend and Essentia mood classifiers (recommended)
+docker build -f Dockerfile.rocm \
+  --build-arg WITH_FASTER_WHISPER=1 \
+  --build-arg WITH_ESSENTIA_MOOD_MODELS=1 \
+  -t audiomuse-ai:rocm .
+
+# Scale to 3 workers (adjust to your core count)
+docker compose -f docker-compose.amd-worker.yml up -d --scale audiomuse-worker=3
+```
+
+**RDNA 2 / RDNA 3 GFX version override** (set in `.env` or `docker-compose.amd-worker.yml`):
+
+| Card generation | `HSA_OVERRIDE_GFX_VERSION` |
+|---|---|
+| RDNA 2 (RX 6000 series) | `10.3.0` |
+| RDNA 3 (RX 7000 series) | `11.0.0` |
+
+**Optional: enable Essentia mood classifiers** (better calibrated than CLAP text-similarity):
+```env
+USE_ESSENTIA_MOOD_MODELS=1
+ESSENTIA_MOOD_MODEL_DIR=/app/model/essentia-mood
+```
+
+**Optional: enable faster-whisper lyrics transcription:**
+```env
+LYRICS_WHISPER_MODEL_DIR=/app/model/faster-whisper-small
+```
+
+**Performance tip:** set `PER_SONG_MODEL_RELOAD=false` to keep ONNX sessions alive across an album instead of reloading after every track. MIGraphX JIT compilation cost is amortised across the album, yielding ~7s/track at steady state.
 
 ## **Hardware Requirements**
 
