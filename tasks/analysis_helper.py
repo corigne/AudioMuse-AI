@@ -5,6 +5,8 @@ import gc
 import importlib
 import logging
 import os
+import time
+from contextlib import contextmanager
 
 import numpy as np
 import librosa
@@ -29,6 +31,70 @@ from app_helper_artist import upsert_artist_mapping
 from psycopg2 import sql as pgsql
 
 logger = logging.getLogger(__name__)
+
+# Redis-based distributed lock to serialize MIGraphX JIT compilation across
+# ALL worker containers.  Each Docker container has its own /tmp, so a file
+# lock only protects within a single container.  Concurrent GPU compilation
+# across containers causes HW Exception (exit 134).  Using Redis (which every
+# worker already connects to) provides global serialisation.
+_MIGRAPHX_LOCK_KEY = 'migraphx:compile:lock'
+# Initial TTL for the lock.  Cold MIGraphX compilation can take up to 10+ min
+# per bucket size (64/128/256).  Warmup runs 3 buckets sequentially, so we
+# need at least 30+ min headroom.  A background thread renews the TTL every
+# 60 s while the lock is held, so this is only a safety valve.
+_MIGRAPHX_LOCK_TTL = 3600  # 1 hour safety valve; heartbeat keeps it alive
+_MIGRAPHX_LOCK_POLL = 5    # seconds between poll attempts while waiting
+_MIGRAPHX_LOCK_HEARTBEAT = 60  # seconds between TTL renewals
+
+
+@contextmanager
+def _migraphx_compile_lock():
+    """Distributed Redis lock around MIGraphX compilation.
+
+    Serialises GPU compilation across all worker containers so only one
+    process compiles at a time.  Falls back to a no-op context if Redis is
+    unreachable so a single-container setup still works.
+
+    A background heartbeat thread renews the TTL every 60 s while the lock
+    is held, preventing expiry during the slow cold-compile path.
+    """
+    import threading
+    import redis as _redis_mod
+    redis_url = os.environ.get('REDIS_URL', 'redis://localhost:6379/0')
+    try:
+        r = _redis_mod.from_url(redis_url, socket_connect_timeout=5)
+        lock_id = str(os.getpid())
+        acquired = False
+        while not acquired:
+            acquired = r.set(_MIGRAPHX_LOCK_KEY, lock_id,
+                             ex=_MIGRAPHX_LOCK_TTL, nx=True)
+            if not acquired:
+                logger.debug("MIGraphX compile lock held — waiting %ds ...",
+                             _MIGRAPHX_LOCK_POLL)
+                time.sleep(_MIGRAPHX_LOCK_POLL)
+
+        # Background thread renews TTL while we hold the lock.
+        _stop_heartbeat = threading.Event()
+
+        def _heartbeat():
+            while not _stop_heartbeat.wait(timeout=_MIGRAPHX_LOCK_HEARTBEAT):
+                try:
+                    # Only renew if we still own the lock.
+                    if r.get(_MIGRAPHX_LOCK_KEY) == lock_id.encode():
+                        r.expire(_MIGRAPHX_LOCK_KEY, _MIGRAPHX_LOCK_TTL)
+                except Exception:
+                    pass
+
+        _hb_thread = threading.Thread(target=_heartbeat, daemon=True)
+        _hb_thread.start()
+        try:
+            yield
+        finally:
+            _stop_heartbeat.set()
+            r.delete(_MIGRAPHX_LOCK_KEY)
+    except Exception as exc:
+        logger.warning("MIGraphX Redis lock unavailable (%s) — proceeding without lock", exc)
+        yield
 
 
 # --- ONNX -------------------------------------------------------------------
@@ -74,8 +140,24 @@ def sigmoid(x):
 
 
 def get_provider_options():
-    """Return [(provider_name, options), ...] preferring CUDA when available."""
-    if 'CUDAExecutionProvider' in ort.get_available_providers():
+    """Return [(provider_name, options), ...] preferring GPU when available.
+
+    Priority: MIGraphX (AMD ROCm 7.x) > ROCM > CUDA (NVIDIA) > CPU.
+    """
+    available = ort.get_available_providers()
+    if 'MIGraphXExecutionProvider' in available:
+        logger.info("MIGraphX provider available - attempting to use AMD GPU for analysis")
+        return [('MIGraphXExecutionProvider', {'device_id': 0}), ('CPUExecutionProvider', {})]
+    if 'ROCMExecutionProvider' in available:
+        rocm = {
+            'device_id': 0,
+            'arena_extend_strategy': 'kSameAsRequested',
+            'miopen_conv_algo_search': 'EXHAUSTIVE',
+            'do_copy_in_default_stream': True,
+        }
+        logger.info("ROCm provider available - attempting to use AMD GPU for analysis")
+        return [('ROCMExecutionProvider', rocm), ('CPUExecutionProvider', {})]
+    if 'CUDAExecutionProvider' in available:
         cuda = {
             'device_id': 0,
             'arena_extend_strategy': 'kSameAsRequested',
@@ -84,7 +166,7 @@ def get_provider_options():
         }
         logger.info("CUDA provider available - attempting to use GPU for analysis")
         return [('CUDAExecutionProvider', cuda), ('CPUExecutionProvider', {})]
-    logger.info("CUDA provider not available - using CPU only")
+    logger.info("No GPU provider available - using CPU only")
     return [('CPUExecutionProvider', {})]
 
 
@@ -101,7 +183,16 @@ def create_onnx_session(model_path, provider_options=None, label="", sess_option
     if sess_options is None:
         sess_options = _default_sess_options()
     extra = {'sess_options': sess_options}
+    uses_migraphx = any(p[0] == 'MIGraphXExecutionProvider' for p in opts)
     try:
+        if uses_migraphx:
+            with _migraphx_compile_lock():
+                return ort.InferenceSession(
+                    model_path,
+                    providers=[p[0] for p in opts],
+                    provider_options=[p[1] for p in opts],
+                    **extra,
+                )
         return ort.InferenceSession(
             model_path,
             providers=[p[0] for p in opts],
@@ -127,6 +218,45 @@ def load_musicnn_sessions(model_paths):
     except Exception as e:
         logger.error(f"Failed to load MusiCNN models: {e}")
         return None
+
+
+_migraphx_warmed_up = False  # per-process flag
+
+
+def migraphx_warmup(embedding_session, buckets, tensor_input_name, tensor_output_name):
+    """Pre-compile all MIGraphX bucket sizes into the existing session.
+
+    MIGraphX JIT-compiles the ONNX graph once per unique input shape per session.
+    Running dummy inference for each bucket through the SAME session — while holding
+    the cross-process compile lock — means:
+      1. All compilations happen sequentially (no concurrent GPU hang risk).
+      2. The existing session has all bucket shapes pre-compiled.
+      3. Every subsequent real-track inference hits the warm compiled path.
+    Called at most once per worker process lifetime (guarded by _migraphx_warmed_up).
+    """
+    global _migraphx_warmed_up
+    if _migraphx_warmed_up:
+        return
+    _migraphx_warmed_up = True
+
+    if 'MIGraphXExecutionProvider' not in embedding_session.get_providers():
+        return
+
+    inp = embedding_session.get_inputs()[0]
+    patch_shape = inp.shape[1:]  # e.g. (187, 96)
+
+    logger.info(f"MIGraphX warmup: pre-compiling {len(buckets)} bucket sizes {buckets} "
+                f"into existing session (serialised via compile lock) ...")
+    for bucket in buckets:
+        dummy = np.zeros((bucket, *patch_shape), dtype=np.float32)
+        feed = {tensor_input_name: dummy}
+        try:
+            with _migraphx_compile_lock():
+                embedding_session.run([tensor_output_name], feed)
+            logger.info(f"  bucket {bucket}: ✓")
+        except Exception as exc:
+            logger.warning(f"  bucket {bucket}: warmup failed ({exc}), continuing")
+    logger.info("MIGraphX warmup complete — all bucket sizes pre-compiled")
 
 
 def cleanup_musicnn_sessions(onnx_sessions, context=""):
